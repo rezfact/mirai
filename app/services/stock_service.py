@@ -1,21 +1,17 @@
 import os
-import pandas as pd
 import numpy as np
+import pandas as pd
 from fastapi import UploadFile, HTTPException
 from sqlalchemy.orm import Session
 from app.models.database import StockData, Prediction
 from datetime import timedelta
 import io
-from statsmodels.tsa.statespace.sarimax import SARIMAX
-from sklearn.metrics import mean_absolute_error, mean_squared_error
-from statsmodels.tsa.holtwinters import ExponentialSmoothing
-import subprocess
-import json
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.model_selection import train_test_split
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout
 from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping
 import tensorflow as tf
 
 # Disable GPU usage to avoid CUDA errors
@@ -53,16 +49,6 @@ def calculate_peter_lynch_fair_value(eps_data):
     print(f"Debug: growth_rate={growth_rate}%, latest_eps={latest_eps}, fair_value={fair_value:.2f}")
     
     return round(fair_value, 2), growth_rate, latest_eps
-
-async def fetch_google_finance_data(stock: str):
-    """Fetch latest stock data from Google Finance"""
-    try:
-        result = subprocess.run(['node', 'fetch_google_finance_data.js', stock], 
-                                capture_output=True, text=True, check=True)
-        return json.loads(result.stdout)
-    except subprocess.CalledProcessError as e:
-        print(f"Error fetching Google Finance data: {e}")
-        return None
 
 async def get_overall_fair_value(stock: str, db: Session):
     """Get fair value calculation for a stock"""
@@ -149,7 +135,9 @@ def create_sequences(data, seq_length):
 
 def build_lstm_model(input_shape):
     model = Sequential([
-        LSTM(64, return_sequences=True, input_shape=input_shape),
+        LSTM(128, return_sequences=True, input_shape=input_shape),
+        Dropout(0.2),
+        LSTM(64, return_sequences=True),
         Dropout(0.2),
         LSTM(32),
         Dropout(0.2),
@@ -160,6 +148,9 @@ def build_lstm_model(input_shape):
 
 def generate_weekly_dates(start_date, num_weeks):
     return [start_date + timedelta(weeks=i) for i in range(num_weeks)]
+
+def simple_moving_average(data, window):
+    return data['close'].rolling(window=window).mean().iloc[-1]
 
 async def upload_csv(file: UploadFile, db: Session):
     df = pd.read_csv(file.file)
@@ -187,56 +178,40 @@ async def train_model(stock: str, db: Session):
     scaler = MinMaxScaler()
     scaled_data = scaler.fit_transform(df[features])
     
-    if len(scaled_data) < 10:
-        # Fallback method for very small datasets
-        last_price = df['close'].iloc[-1]
-        future_dates = generate_weekly_dates(df.index[-1] + timedelta(days=1), 4)
-        
-        # Delete existing predictions for this stock
-        db.query(Prediction).filter(Prediction.stock == stock).delete()
-        
-        for date in future_dates:
-            prediction = Prediction(
-                stock=stock,
-                date=date,
-                predicted_close=last_price,
-                predicted_low=last_price * 0.95,
-                predicted_high=last_price * 1.05
-            )
-            db.add(prediction)
-        
-        db.commit()
-        return {"message": "Not enough data for LSTM model. Simple prediction based on last price generated."}
-    
-    seq_length = min(10, len(scaled_data) // 2)
+    seq_length = min(30, len(scaled_data) // 10)
     X, y = create_sequences(scaled_data, seq_length)
     
-    if len(X) < 2:
-        raise ValueError("Not enough data for training. Need at least 2 sequences.")
-    
-    # Adjust validation split based on data size
-    validation_split = min(0.1, (len(X) - 1) / len(X))
+    if len(X) < 100:
+        X_train, y_train = X, y
+        X_test, y_test = X, y
+    else:
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
     
     model = build_lstm_model((seq_length, len(features)))
-    model.fit(X, y, epochs=50, batch_size=min(32, len(X)), validation_split=validation_split, verbose=0)
+    early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+    
+    batch_size = min(64, len(X_train))
+    validation_split = 0.2 if len(X_train) > 100 else 0
+    
+    model.fit(X_train, y_train, epochs=100, batch_size=batch_size, validation_split=validation_split, callbacks=[early_stopping], verbose=0)
+    
+    # Evaluate the model
+    performance = evaluate_model(model, X_test, y_test, scaler)
     
     last_sequence = X[-1].reshape(1, seq_length, len(features))
     last_date = df.index[-1]
     future_dates = generate_weekly_dates(last_date + timedelta(days=1), 4)
     future_predictions = []
     
-    for _ in range(4):  # Predict for 4 weeks
+    for _ in range(4):
         next_pred = model.predict(last_sequence)
         future_predictions.append(next_pred[0])
-        
-        # Update last_sequence for the next iteration
         last_sequence = np.roll(last_sequence, -1, axis=1)
         last_sequence[0, -1, :] = next_pred
 
     future_predictions = np.array(future_predictions)
     future_predictions = scaler.inverse_transform(future_predictions)
     
-    # Use the standard deviation of the entire dataset for prediction intervals
     std_dev = np.std(df['close'])
     lower_bound = future_predictions[:, 3] - 1.96 * std_dev
     upper_bound = future_predictions[:, 3] + 1.96 * std_dev
@@ -255,8 +230,7 @@ async def train_model(stock: str, db: Session):
         db.add(prediction)
     
     db.commit()
-    return {"message": "Model trained and predictions generated successfully"}
-
+    return {"message": "Model trained and predictions generated successfully", "performance": performance}
 
 async def correct_forecast(stock: str, file: UploadFile, db: Session):
     try:
@@ -293,7 +267,7 @@ async def correct_forecast(stock: str, file: UploadFile, db: Session):
         scaled_data = scaler.fit_transform(combined_data[features])
         
         # Adjust sequence length based on data size
-        seq_length = min(5, len(scaled_data) // 4)
+        seq_length = min(30, len(scaled_data) // 10)
         
         if len(scaled_data) < seq_length + 1:
             # Fallback method for very small datasets
@@ -305,8 +279,7 @@ async def correct_forecast(stock: str, file: UploadFile, db: Session):
                     date=date,
                     predicted_close=last_price,
                     predicted_low=last_price * 0.95,
-                    predicted_high=last_price * 1.05,
-                    correction=None
+                    predicted_high=last_price * 1.05
                 )
                 db.add(prediction)
             db.commit()
@@ -315,21 +288,23 @@ async def correct_forecast(stock: str, file: UploadFile, db: Session):
         X, y = create_sequences(scaled_data, seq_length)
         
         # Use all data for training if there's not enough for validation
-        if len(X) < 2:
+        if len(X) < 100:
             X_train, y_train = X, y
             X_test, y_test = X, y
         else:
-            # Adjust train-test split ratio for smaller datasets
-            test_size = max(0.1, min(0.2, 1 - (seq_length + 1) / len(X)))
-            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, shuffle=False)
+            # Adjust train-test split ratio for larger datasets
+            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
         
         model = build_lstm_model((seq_length, len(features)))
         
-        # Adjust batch size and validation split based on data size
-        batch_size = min(32, len(X_train))
-        validation_split = 0.1 if len(X_train) > 10 else 0
+        # Implement early stopping
+        early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
         
-        model.fit(X_train, y_train, epochs=50, batch_size=batch_size, validation_split=validation_split, verbose=0)
+        # Adjust batch size and validation split based on data size
+        batch_size = min(64, len(X_train))
+        validation_split = 0.2 if len(X_train) > 100 else 0
+        
+        model.fit(X_train, y_train, epochs=100, batch_size=batch_size, validation_split=validation_split, callbacks=[early_stopping], verbose=0)
         
         all_sequences = create_sequences(scaled_data, seq_length)[0]
         predictions = model.predict(all_sequences)
@@ -363,30 +338,9 @@ async def correct_forecast(stock: str, file: UploadFile, db: Session):
                     date=date,
                     predicted_close=pred,
                     predicted_low=lower,
-                    predicted_high=upper,
-                    correction=None
+                    predicted_high=upper
                 )
                 db.add(new_prediction)
-        
-        # Apply exponential smoothing for correction
-        alpha = 0.3  # Smoothing factor
-        for date in combined_data.index[seq_length:]:
-            if date <= last_prediction_date:
-                continue  # Skip dates that already have predictions
-            
-            actual_data = combined_data.loc[date]
-            prediction = db.query(Prediction).filter(
-                Prediction.stock == stock,
-                Prediction.date == date
-            ).first()
-            
-            if prediction and not pd.isna(actual_data['close']):
-                correction = actual_data['close'] - prediction.predicted_close
-                smoothed_correction = alpha * correction + (1 - alpha) * (prediction.correction if prediction.correction is not None else 0)
-                prediction.correction = smoothed_correction
-                prediction.predicted_close += smoothed_correction
-                prediction.predicted_low += smoothed_correction
-                prediction.predicted_high += smoothed_correction
         
         # Generate new predictions for the next 4 weeks
         last_sequence = all_sequences[-1]
@@ -410,8 +364,7 @@ async def correct_forecast(stock: str, file: UploadFile, db: Session):
                 date=date,
                 predicted_close=pred,
                 predicted_low=lower,
-                predicted_high=upper,
-                correction=None
+                predicted_high=upper
             )
             db.add(new_prediction)
         
@@ -425,16 +378,38 @@ async def correct_forecast(stock: str, file: UploadFile, db: Session):
         db.rollback()
         raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
 
+
+def remove_duplicate_predictions(stock: str, db: Session):
+    predictions = db.query(Prediction).filter(Prediction.stock == stock).order_by(Prediction.date).all()
+    unique_dates = set()
+    for prediction in predictions:
+        if prediction.date not in unique_dates:
+            unique_dates.add(prediction.date)
+        else:
+            db.delete(prediction)
+    db.commit()
+
 async def get_predictions(stock: str, db: Session):
     predictions = db.query(Prediction).filter(Prediction.stock == stock).order_by(Prediction.date).all()
     return predictions
 
-def evaluate_model(actual, predicted):
-    mae = mean_absolute_error(actual, predicted)
-    mse = mean_squared_error(actual, predicted)
+# Add this function to evaluate the model's performance
+def evaluate_model(model, X_test, y_test, scaler):
+    predictions = model.predict(X_test)
+    predictions = scaler.inverse_transform(predictions)[:, 3]  # Close price is at index 3
+    actual = scaler.inverse_transform(y_test)[:, 3]
+    
+    mse = np.mean((predictions - actual) ** 2)
     rmse = np.sqrt(mse)
-    mape = np.mean(np.abs((actual - predicted) / actual)) * 100
-    return {'MAE': mae, 'MSE': mse, 'RMSE': rmse, 'MAPE': mape}
+    mae = np.mean(np.abs(predictions - actual))
+    mape = np.mean(np.abs((predictions - actual) / actual)) * 100
+    
+    return {
+        "MSE": mse,
+        "RMSE": rmse,
+        "MAE": mae,
+        "MAPE": mape
+    }
 
 async def model_performance(stock: str, db: Session):
     data = db.query(StockData).filter(StockData.stock == stock).order_by(StockData.date).all()

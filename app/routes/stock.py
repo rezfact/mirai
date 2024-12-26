@@ -1,12 +1,17 @@
 import os
 import re
-from fastapi import APIRouter, Depends, UploadFile, File, HTTPException
+import io
+from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, Query
 from sqlalchemy.orm import Session
 from app.utils.db_helper import get_db
-from app.services.stock_service import upload_csv, train_model, correct_forecast, get_predictions, model_performance, get_overall_fair_value, calculate_earnings_growth_rate, get_price_range_data
+from app.services.stock_service import (
+    upload_csv, train_model, correct_forecast, get_predictions, 
+    model_performance, get_overall_fair_value, get_price_range_data
+)
 from typing import List, Dict
 from pydantic import BaseModel
 from datetime import datetime
+import pandas as pd
 
 router = APIRouter()
 
@@ -52,26 +57,35 @@ async def auto_correct(stock: str, db: Session = Depends(get_db)):
         f for f in os.listdir(stock_data_dir)
         if f.endswith('.csv') and f.startswith(f"{stock}-")
     ]
-    
+
     # Sort by year and month
     csv_files.sort(key=lambda x: (
         int(re.search(r'-(\d{2})-(\d{4})\.csv$', x).group(2)),  # Year
         int(re.search(r'-(\d{2})-(\d{4})\.csv$', x).group(1))   # Month
     ))
-    
+
     if not csv_files:
         raise HTTPException(status_code=404, detail=f"No CSV files found for stock {stock}")
     
+    accumulated_data = pd.DataFrame()
     results = []
+
     for csv_file in csv_files:
         file_path = os.path.join(stock_data_dir, csv_file)
         with open(file_path, 'rb') as f:
-            file = UploadFile(filename=csv_file, file=f)
+            file_content = f.read()
+            new_data = pd.read_csv(io.StringIO(file_content.decode('utf-8')))
+            accumulated_data = pd.concat([accumulated_data, new_data]).drop_duplicates().reset_index(drop=True)
+
+        if len(accumulated_data) >= 10:
+            csv_content = accumulated_data.to_csv(index=False).encode()
+            file = UploadFile(filename=csv_file, file=io.BytesIO(csv_content))
             result = await correct_forecast(stock, file, db)
             results.append({"file": csv_file, "result": result})
-    
-    return {"message": f"Processed {len(results)} files in chronological order", "results": results}
+        else:
+            results.append({"file": csv_file, "result": {"message": f"Accumulating data. Current data points: {len(accumulated_data)}"}})
 
+    return {"message": f"Processed {len(csv_files)} files in chronological order", "results": results}
 
 @router.get("/fair-value/{stock}")
 async def overall_fair_value(stock: str, db: Session = Depends(get_db)):
@@ -113,4 +127,3 @@ async def price_range(stock: str, db: Session = Depends(get_db)):
         return response
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
-

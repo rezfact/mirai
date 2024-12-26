@@ -7,7 +7,7 @@ class StockData(Base):
     __tablename__ = "stock_data"
 
     id = Column(Integer, primary_key=True, index=True)
-    stock = Column(String(10))  # Changed from stock_id to stock
+    stock = Column(String(10))
     date = Column(DateTime)
     open = Column(Float)
     high = Column(Float)
@@ -24,7 +24,6 @@ class Prediction(Base):
     predicted_close = Column(Float)
     predicted_low = Column(Float)
     predicted_high = Column(Float)
-    correction = Column(Float, nullable=True)
 
 class EPS(Base):
     __tablename__ = "eps"
