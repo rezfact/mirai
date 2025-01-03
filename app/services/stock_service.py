@@ -200,8 +200,9 @@ async def upload_csv(stock: str, file_content: bytes, db: Session):
         logger.error(f"Error in upload_csv for stock {stock}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"An error occurred while uploading CSV: {str(e)}")
 
-async def train_model(stock: str, db: Session, prediction_weeks: int = 52):  # Changed to 52 weeks (1 year)
+async def train_model(stock: str, db: Session):
     try:
+        # Fetch all existing data for the stock
         data = db.query(StockData).filter(StockData.stock == stock).order_by(StockData.date).all()
         if not data:
             logger.warning(f"No data available for training stock {stock}")
@@ -211,123 +212,63 @@ async def train_model(stock: str, db: Session, prediction_weeks: int = 52):  # C
         df['date'] = pd.to_datetime(df['date'])
         df = df.set_index('date')
 
-        if len(df) < 4:
-            logger.warning(f"Insufficient data for any prediction for stock {stock}. Current data points: {len(df)}")
-            return {"message": f"Insufficient data for prediction. At least 4 data points are required. Current data points: {len(df)}"}
+        if len(df) < 3:
+            logger.warning(f"Insufficient data for prediction for stock {stock}. Current data points: {len(df)}")
+            return {"message": f"Insufficient data for prediction. At least 3 data points are required. Current data points: {len(df)}"}
 
-        features = ['open', 'high', 'low', 'close', 'volume']
+        # Determine the last month in the data
+        last_month = df.index[-1].replace(day=1)
         
-        # Generate predictions for the next year
-        last_date = df.index[-1]
-        future_dates = pd.date_range(start=last_date + timedelta(days=1), periods=prediction_weeks, freq='W-MON')
+        # Generate prediction dates for the next month
+        next_month = last_month + pd.offsets.MonthBegin(1)
+        prediction_dates = pd.date_range(start=next_month, end=next_month + pd.offsets.MonthEnd(1), freq='W-FRI')
         
-        if len(df) < 30:
-            logger.info(f"Using simple moving average for stock {stock} due to limited data points: {len(df)}")
-            # Use simple moving average for small datasets
-            last_close = df['close'].iloc[-1]
-            sma_5 = simple_moving_average(df, 5)
-            sma_all = df['close'].mean()
-            
-            predictions = []
-            for i in range(prediction_weeks):
-                weight = max(0, 1 - i*0.05)  # Decrease weight more slowly for further predictions
-                pred = (last_close * 0.5 + sma_5 * 0.3 + sma_all * 0.2) * weight + sma_all * (1 - weight)
-                predictions.append(pred)
-            
-            std_dev = np.std(df['close'])
-            lower_bound = [pred - 1.96 * std_dev for pred in predictions]
-            upper_bound = [pred + 1.96 * std_dev for pred in predictions]
-        else:
-            logger.info(f"Training LSTM model for stock {stock} with {len(df)} data points")
-            
-            # Feature engineering
-            df['returns'] = df['close'].pct_change()
-            df['ma_50'] = df['close'].rolling(window=50).mean()
-            df['ma_200'] = df['close'].rolling(window=200).mean()
-            df['ema_20'] = df['close'].ewm(span=20, adjust=False).mean()
-            df['volatility'] = df['returns'].rolling(window=20).std()
-            
-            df = df.dropna()
-            
-            if len(df) == 0:
-                logger.warning(f"No valid data points after feature engineering for stock {stock}")
-                return {"message": "No valid data points after feature engineering"}
-            
-            features = ['open', 'high', 'low', 'close', 'volume', 'returns', 'ma_50', 'ma_200', 'ema_20', 'volatility']
-            
-            scaler = MinMaxScaler()
-            scaled_data = scaler.fit_transform(df[features])
-            
-            seq_length = min(30, len(scaled_data) - 1)  # Ensure seq_length is not larger than available data
-            X, y = create_sequences(scaled_data, seq_length)
-            
-            if len(X) == 0:
-                logger.warning(f"No sequences could be created for stock {stock}. Available data points: {len(df)}")
-                return {"message": f"Insufficient data for sequence creation. Available data points: {len(df)}"}
-            
-            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
-            
-            model = build_lstm_model((seq_length, len(features)))
-            early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
-            
-            batch_size = min(32, len(X_train))
-            
-            model.fit(X_train, y_train, epochs=100, batch_size=batch_size, validation_split=0.2, callbacks=[early_stopping], verbose=0)
-            
-            # Evaluate the model
-            performance = evaluate_model(model, X_test, y_test, scaler)
-            
-            last_sequence = X[-1].reshape(1, seq_length, len(features))
-            predictions = []
-            
-            for _ in range(prediction_weeks):
-                next_pred = model.predict(last_sequence)
-                predictions.append(next_pred[0][3])  # Append only the close price prediction
-                
-                # Update the last sequence for the next prediction
-                new_row = next_pred[0]
-                new_row[5] = (new_row[3] - last_sequence[0, -1, 3]) / last_sequence[0, -1, 3]  # Calculate returns
-                new_row[6] = np.mean(last_sequence[0, -49:, 3])  # Update MA 50
-                new_row[7] = np.mean(last_sequence[0, -199:, 3])  # Update MA 200
-                new_row[8] = new_row[3] * 0.0952 + last_sequence[0, -1, 8] * 0.9048  # Update EMA 20
-                new_row[9] = np.std(last_sequence[0, -19:, 5])  # Update volatility
-                
-                last_sequence = np.roll(last_sequence, -1, axis=1)
-                last_sequence[0, -1, :] = new_row
+        # Adjust for potential holidays (move Friday to Thursday if necessary)
+        prediction_dates = [date - timedelta(days=1) if date.weekday() == 4 and date not in df.index else date for date in prediction_dates]
 
-            predictions = np.array(predictions)
-            predictions = scaler.inverse_transform(np.column_stack((np.zeros((len(predictions), 3)), predictions, np.zeros((len(predictions), 6)))))[:, 3]
-            
-            std_dev = np.std(df['close'])
-            lower_bound = predictions - 1.96 * std_dev
-            upper_bound = predictions + 1.96 * std_dev
+        # Simple prediction model (you can replace this with a more sophisticated model)
+        last_close = df['close'].iloc[-1]
+        sma_5 = simple_moving_average(df, 5)
+        ema_20 = exponential_moving_average(df, 20)
 
-        # Update existing predictions and add new ones
-        existing_predictions = db.query(Prediction).filter(Prediction.stock == stock).all()
-        existing_dates = {pred.date.date() for pred in existing_predictions}
+        predictions = []
+        for i, date in enumerate(prediction_dates):
+            weight = max(0, 1 - i*0.2)  # Decrease weight for further predictions
+            pred_close = (last_close * 0.5 + sma_5 * 0.3 + ema_20 * 0.2) * weight + ema_20 * (1 - weight)
+            std_dev = np.std(df['close'][-20:])  # Use last 20 data points for volatility estimation
+            pred_low = pred_close - 1.96 * std_dev
+            pred_high = pred_close + 1.96 * std_dev
+            predictions.append({
+                'date': date,
+                'predicted_close': float(pred_close),
+                'predicted_low': float(pred_low),
+                'predicted_high': float(pred_high)
+            })
 
-        for date, pred, lower, upper in zip(future_dates, predictions, lower_bound, upper_bound):
-            date = date.date()  # Convert to date object for comparison
-            if date in existing_dates:
-                # Update existing prediction
-                existing_pred = next(p for p in existing_predictions if p.date.date() == date)
-                existing_pred.predicted_close = float(pred)
-                existing_pred.predicted_low = float(lower)
-                existing_pred.predicted_high = float(upper)
+        # Update existing predictions or add new ones
+        for pred in predictions:
+            existing_pred = db.query(Prediction).filter(
+                Prediction.stock == stock,
+                Prediction.date == pred['date']
+            ).first()
+
+            if existing_pred:
+                existing_pred.predicted_close = pred['predicted_close']
+                existing_pred.predicted_low = pred['predicted_low']
+                existing_pred.predicted_high = pred['predicted_high']
             else:
-                # Add new prediction
-                new_prediction = Prediction(
+                new_pred = Prediction(
                     stock=stock,
-                    date=date,
-                    predicted_close=float(pred),
-                    predicted_low=float(lower),
-                    predicted_high=float(upper)
+                    date=pred['date'],
+                    predicted_close=pred['predicted_close'],
+                    predicted_low=pred['predicted_low'],
+                    predicted_high=pred['predicted_high']
                 )
-                db.add(new_prediction)
+                db.add(new_pred)
 
         db.commit()
         logger.info(f"Successfully trained model and updated predictions for stock {stock}")
-        return {"message": "Model trained and predictions updated successfully", "performance": performance if len(df) >= 30 else None, "data_points": len(df)}
+        return {"message": "Model trained and predictions updated successfully", "predictions": predictions}
     except Exception as e:
         logger.error(f"Error in train_model for stock {stock}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"An error occurred while training the model: {str(e)}")
@@ -365,9 +306,9 @@ async def trains(stock: str, csv_files: List[str], db: Session):
                 upload_result = await upload_csv(stock, file_content, db)
                 logger.info(f"Upload result for {csv_file}: {upload_result}")
                 
-                # Train model and update predictions for the next year (52 weeks)
+                # Train model and update predictions
                 logger.info(f"Starting model training for {csv_file}")
-                train_result = await train_model(stock, db, prediction_weeks=52)
+                train_result = await train_model(stock, db)
                 logger.info(f"Training result for {csv_file}: {train_result}")
                 
                 results.append({
