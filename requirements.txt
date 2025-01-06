@@ -8,3 +8,5 @@ scikit-learn
 python-multipart
 pymysql
 cryptography
+aiohttp
+bs4

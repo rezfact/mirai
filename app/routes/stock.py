@@ -8,6 +8,7 @@ from app.services.stock_service import (
     upload_csv, train_model, correct_forecast, get_predictions, 
     model_performance, get_overall_fair_value, get_price_range_data, trains
 )
+from app.services.crawl_service import crawl_ksei_data
 from typing import List, Dict
 from pydantic import BaseModel
 from datetime import datetime
@@ -181,3 +182,39 @@ async def price_range(stock: str, db: Session = Depends(get_db)):
         return response
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
+
+@router.get("/ksei/{month}-{year}")
+async def crawl_ksei(month: int, year: int, db: Session = Depends(get_db)):
+    try:
+        result = await crawl_ksei_data(month, year, db)
+        return {"message": "KSEI data crawled and saved successfully", "count": len(result)}
+    except Exception as e:
+        logger.error(f"Error in crawl_ksei for {month}-{year}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"An error occurred while crawling KSEI data: {str(e)}")
+
+@router.get("/ksei/{month}-{year}/cd")
+async def crawl_ksei_cum_date(month: int, year: int, db: Session = Depends(get_db)):
+    try:
+        result = await crawl_ksei_data(month, year, db, event_type="Cum Date")
+        return {"message": "KSEI Cum Date data crawled and saved successfully", "count": len(result)}
+    except Exception as e:
+        logger.error(f"Error in crawl_ksei_cum_date for {month}-{year}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"An error occurred while crawling KSEI Cum Date data: {str(e)}")
+
+@router.get("/ksei/{month}-{year}/ed")
+async def crawl_ksei_effective_date(month: int, year: int, db: Session = Depends(get_db)):
+    try:
+        result = await crawl_ksei_data(month, year, db, event_type="Effective Date")
+        return {"message": "KSEI Effective Date data crawled and saved successfully", "count": len(result)}
+    except Exception as e:
+        logger.error(f"Error in crawl_ksei_effective_date for {month}-{year}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"An error occurred while crawling KSEI Effective Date data: {str(e)}")
+
+@router.get("/ksei/{month}-{year}/rd")
+async def crawl_ksei_record_date(month: int, year: int, db: Session = Depends(get_db)):
+    try:
+        result = await crawl_ksei_data(month, year, db, event_type="Record Date")
+        return {"message": "KSEI Record Date data crawled and saved successfully", "count": len(result)}
+    except Exception as e:
+        logger.error(f"Error in crawl_ksei_record_date for {month}-{year}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"An error occurred while crawling KSEI Record Date data: {str(e)}")
