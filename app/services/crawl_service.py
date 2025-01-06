@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from app.models.database import StockInfo
 import logging
 import ssl
+import json
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +47,16 @@ async def fetch_ksei_data(month: int, year: int):
     url = f"https://www.ksei.co.id/ksei_calendar/get_json/event-{month}-{year}-all.json"
     async with aiohttp.ClientSession() as session:
         data = await fetch_with_retry(session, url)
-        return await asyncio.get_event_loop().run_in_executor(None, lambda: eval(data))
+
+        # Parse the JSON data
+        json_data = json.loads(data)
+
+        # Fix the escaped forward slashes in the description
+        for event_group in json_data['data']:
+            for event in event_group['events']:
+                event['description'] = event['description'].replace('\/', '/')
+
+        return json_data
 
 async def fetch_ksei_detail(url: str):
     async with aiohttp.ClientSession() as session:
@@ -78,7 +88,7 @@ async def parse_ksei_detail(html: str):
 
 async def crawl_ksei_data(month: int, year: int, db: Session, event_type: str = None):
     json_data = await fetch_ksei_data(month, year)
-    
+    print(json_data)
     color_map = {
         "#565553": "Cum Date",
         "#97191C": "Effective Date",
@@ -93,7 +103,7 @@ async def crawl_ksei_data(month: int, year: int, db: Session, event_type: str = 
             continue
         
         for event in event_group['events']:
-            detail_url = f"https://www.ksei.co.id{event['description'].replace('\/', '/')}"
+            detail_url = f"https://www.ksei.co.id{event['description']}"
             detail_html = await fetch_ksei_detail(detail_url)
             parsed_data = await parse_ksei_detail(detail_html)
             
